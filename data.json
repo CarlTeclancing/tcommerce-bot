@@ -1,0 +1,32 @@
+{
+  "users": {},
+  "products": {
+    "Electronics": [
+      {
+        "id": "p1",
+        "name": "USB-C Headphones",
+        "description": "Noise-cancelling USB-C headphones.",
+        "price": 29.99
+      },
+      {
+        "id": "p2",
+        "name": "Portable Charger 10,000mAh",
+        "description": "Fast charging power bank.",
+        "price": 19.99
+      }
+    ],
+    "Books": [
+      {
+        "id": "p3",
+        "name": "Learn Python",
+        "description": "Beginner-friendly Python guide.",
+        "price": 9.99
+      }
+    ]
+  },
+  "payment": {
+    "btc_address": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
+    "usdt_address": "TetherDummyAddress1234567890"
+  },
+  "orders": []
+}
