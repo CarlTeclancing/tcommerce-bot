@@ -5,13 +5,14 @@ import time
 from functools import wraps
 from uuid import uuid4
 from dotenv import load_dotenv
-from telegram import (Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update)
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update)
 from telegram.ext import (Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler, ConversationHandler, CallbackContext)
 
 load_dotenv()
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 if not TOKEN:
     print("Please set TELEGRAM_TOKEN in environment or .env file")
+    exit(1)
 
 DATA_FILE = os.path.join(os.path.dirname(__file__), 'data.json')
 
@@ -19,7 +20,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_SECRET, ASK_COUNTRY, MAIN_MENU = range(3)
+ASK_SECRET, ASK_COUNTRY, MAIN_MENU, CHECKOUT_ADDR, CHECKOUT_NOTES, CHECKOUT_PAYTYPE = range(6)
 
 # Helper JSON functions
 
@@ -38,12 +39,11 @@ def ensure_user(func):
     @wraps(func)
     def wrapped(update: Update, context: CallbackContext, *args, **kwargs):
         user = update.effective_user
-        chat_id = update.effective_chat.id
         data = load_data()
-        # try to find user by telegram username or id
+        # try to find user by telegram id
         found = None
         for secret, u in data.get('users', {}).items():
-            if u.get('telegram_id') == user.id or u.get('username') == (user.username or ''):
+            if u.get('telegram_id') == user.id:
                 found = secret
                 break
         if not found:
@@ -67,8 +67,9 @@ def ask_country(update: Update, context: CallbackContext):
     secret = update.message.text.strip()
     data = load_data()
     users = data.setdefault('users', {})
+    
     if secret in users:
-        update.message.reply_text("This secret phrase is already registered. If it's yours, continue.\nPlease select your country:")
+        update.message.reply_text("This secret phrase is already registered. Welcome back!")
     else:
         users[secret] = {
             'username': update.effective_user.username or '',
@@ -78,12 +79,14 @@ def ask_country(update: Update, context: CallbackContext):
             'orders': []
         }
         save_data(data)
-        update.message.reply_text("Secret saved. Now select your country:")
+        update.message.reply_text("Secret saved!")
+    
     # country selection keyboard
     countries = ['USA', 'UK', 'Nigeria', 'India', 'Other']
     keyboard = ReplyKeyboardMarkup([[c] for c in countries], one_time_keyboard=True, resize_keyboard=True)
     context.user_data['pending_secret'] = secret
-    return ASK_COUNTRY, update.message.reply_text('Choose your country:', reply_markup=keyboard)
+    update.message.reply_text('Please choose your country:', reply_markup=keyboard)
+    return ASK_COUNTRY
 
 
 def save_country(update: Update, context: CallbackContext):
@@ -116,9 +119,8 @@ def show_main_menu(update: Update, context: CallbackContext):
         ['Order History', 'Support']
     ]
     if update.callback_query:
-        # if called from callback query
         update.callback_query.answer()
-        update.callback_query.edit_message_text('Main Menu', reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=False, resize_keyboard=True))
+        update.callback_query.edit_message_text('Main Menu:', reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
     else:
         update.message.reply_text('Main Menu:', reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
     return MAIN_MENU
@@ -127,11 +129,13 @@ def show_main_menu(update: Update, context: CallbackContext):
 @ensure_user
 def about(update: Update, context: CallbackContext):
     update.message.reply_text('This is a demo ecommerce bot. You can browse products, add to cart, and checkout.')
+    return MAIN_MENU
 
 
 @ensure_user
 def support(update: Update, context: CallbackContext):
     update.message.reply_text('Support: contact support@example.com or reply here and an agent will reach out.')
+    return MAIN_MENU
 
 
 @ensure_user
@@ -140,9 +144,10 @@ def list_categories(update: Update, context: CallbackContext):
     cats = list(data.get('products', {}).keys())
     if not cats:
         update.message.reply_text('No product categories available.')
-        return
-    buttons = [[InlineKeyboardButton(c, callback_data=f'cat|{c}')] for c in cats]
+        return MAIN_MENU
+    buttons = [[InlineKeyboardButton(c, callback_data='cat|{}'.format(c))] for c in cats]
     update.message.reply_text('Product categories:', reply_markup=InlineKeyboardMarkup(buttons))
+    return MAIN_MENU
 
 
 def category_callback(update: Update, context: CallbackContext):
@@ -154,11 +159,15 @@ def category_callback(update: Update, context: CallbackContext):
     if not products:
         query.edit_message_text('No products in this category.')
         return
-    text = f"Products in {cat}:\n"
+    text = "Products in {}:\n".format(cat)
     buttons = []
     for p in products:
-        text += f"\n{p['name']} — ${p['price']}\n{p['description']}\n"
-        buttons.append([InlineKeyboardButton(f"Add {p['name']}", callback_data=f'add|{p['id']}')])
+        name = p['name']
+        price = p['price']
+        desc = p['description']
+        pid = p['id']
+        text += "\n{} — ${}\n{}\n".format(name, price, desc)
+        buttons.append([InlineKeyboardButton("Add {}".format(name), callback_data='add|{}'.format(pid))])
     buttons.append([InlineKeyboardButton('Back to categories', callback_data='backcats')])
     query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -197,7 +206,7 @@ def add_to_cart_callback(update: Update, context: CallbackContext):
     cart = users[secret].setdefault('cart', [])
     cart.append({'id': product['id'], 'name': product['name'], 'price': product['price']})
     save_data(data)
-    query.edit_message_text(f"Added {product['name']} to cart.")
+    query.answer("Added {} to cart.".format(product['name']), show_alert=True)
 
 
 @ensure_user
@@ -208,14 +217,15 @@ def view_cart(update: Update, context: CallbackContext):
     cart = user.get('cart', [])
     if not cart:
         update.message.reply_text('Your cart is empty.')
-        return
+        return MAIN_MENU
     text = 'Your cart:\n'
     total = 0
     for idx, item in enumerate(cart, 1):
-        text += f"{idx}. {item['name']} — ${item['price']}\n"
+        text += "{0}. {1} — ${2}\n".format(idx, item['name'], item['price'])
         total += item['price']
-    text += f"\nTotal: ${total:.2f}"
+    text += "\nTotal: ${:.2f}".format(total)
     update.message.reply_text(text)
+    return MAIN_MENU
 
 
 @ensure_user
@@ -226,47 +236,43 @@ def checkout_start(update: Update, context: CallbackContext):
     cart = user.get('cart', [])
     if not cart:
         update.message.reply_text('Your cart is empty. Add products first.')
-        return
+        return MAIN_MENU
     update.message.reply_text('Please enter delivery address:')
-    return 'ADDR'
+    return CHECKOUT_ADDR
 
 
 def checkout_addr(update: Update, context: CallbackContext):
     addr = update.message.text.strip()
     context.user_data['addr'] = addr
-    update.message.reply_text('Any delivery notes? (or send /skip)')
-    return 'NOTES'
+    update.message.reply_text('Any delivery notes? (or send "skip")')
+    return CHECKOUT_NOTES
 
 
 def checkout_notes(update: Update, context: CallbackContext):
     notes = update.message.text.strip()
-    context.user_data['notes'] = notes
-    # ask payment type
+    if notes.lower() == 'skip':
+        context.user_data['notes'] = ''
+    else:
+        context.user_data['notes'] = notes
     keyboard = ReplyKeyboardMarkup([['BTC', 'USDT']], one_time_keyboard=True, resize_keyboard=True)
     update.message.reply_text('Choose payment type:', reply_markup=keyboard)
-    return 'PAYTYPE'
-
-
-def checkout_skip_notes(update: Update, context: CallbackContext):
-    context.user_data['notes'] = ''
-    keyboard = ReplyKeyboardMarkup([['BTC', 'USDT']], one_time_keyboard=True, resize_keyboard=True)
-    update.message.reply_text('Choose payment type:', reply_markup=keyboard)
-    return 'PAYTYPE'
+    return CHECKOUT_PAYTYPE
 
 
 def checkout_paytype(update: Update, context: CallbackContext):
     pay = update.message.text.strip().upper()
     if pay not in ('BTC', 'USDT'):
         update.message.reply_text('Invalid payment type. Choose BTC or USDT.')
-        return 'PAYTYPE'
-    # create order
+        return CHECKOUT_PAYTYPE
+    
     secret = context.user_data.get('secret')
     data = load_data()
     user = data['users'].get(secret)
     cart = user.get('cart', [])
     if not cart:
         update.message.reply_text('Your cart is empty. Aborting.')
-        return ConversationHandler.END
+        return MAIN_MENU
+    
     order_id = str(int(time.time())) + '-' + uuid4().hex[:6]
     order = {
         'order_id': order_id,
@@ -279,15 +285,17 @@ def checkout_paytype(update: Update, context: CallbackContext):
         'timestamp': int(time.time())
     }
     data.setdefault('orders', []).append(order)
-    # attach to user's orders and clear cart
     user.setdefault('orders', []).append(order_id)
     user['cart'] = []
     save_data(data)
-    # give payment info
+    
     payinfo = data.get('payment', {})
     addrinfo = payinfo.get('btc_address') if pay == 'BTC' else payinfo.get('usdt_address')
-    update.message.reply_text(f"Order {order_id} created. Pay {order_total(order)} {pay} to: {addrinfo}\nThen send /track {order_id} to see status.")
-    return ConversationHandler.END
+    total = order_total(order)
+    msg = "Order {} created!\nTotal: {:.2f} {}\nPay to: {}\n\nThen send /track {} to see status.".format(
+        order_id, total, pay, addrinfo, order_id)
+    update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
+    return show_main_menu(update, context)
 
 
 def order_total(order):
@@ -304,7 +312,7 @@ def track_order(update: Update, context: CallbackContext):
     data = load_data()
     for o in data.get('orders', []):
         if o['order_id'] == oid:
-            update.message.reply_text(f"Order {oid}: status {o['status']}. Items: {len(o['items'])} Total: ${order_total(o):.2f}")
+            update.message.reply_text("Order {}: status {}. Items: {} Total: ${:.2f}".format(oid, o['status'], len(o['items']), order_total(o)))
             return
     update.message.reply_text('Order not found.')
 
@@ -316,11 +324,15 @@ def order_history(update: Update, context: CallbackContext):
     orders = [o for o in data.get('orders', []) if o.get('user') == secret]
     if not orders:
         update.message.reply_text('No orders yet.')
-        return
+        return MAIN_MENU
     text = 'Your orders:\n'
     for o in orders:
-        text += f"{o['order_id']} — {o['status']} — ${order_total(o):.2f}\n"
+        oid = o['order_id']
+        status = o['status']
+        total = order_total(o)
+        text += "{} — {} — ${:.2f}\n".format(oid, status, total)
     update.message.reply_text(text)
+    return MAIN_MENU
 
 
 def cancel(update: Update, context: CallbackContext):
@@ -332,19 +344,23 @@ def main():
     updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
 
+    # Main conversation handler
     conv = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
             ASK_SECRET: [MessageHandler(Filters.text & ~Filters.command, ask_country)],
             ASK_COUNTRY: [MessageHandler(Filters.text & ~Filters.command, save_country)],
             MAIN_MENU: [
-                MessageHandler(Filters.regex('^(About)$'), about),
-                MessageHandler(Filters.regex('^(Products)$'), list_categories),
-                MessageHandler(Filters.regex('^(Cart)$'), view_cart),
-                MessageHandler(Filters.regex('^(Checkout)$'), checkout_start),
-                MessageHandler(Filters.regex('^(Order History)$'), order_history),
-                MessageHandler(Filters.regex('^(Support)$'), support),
-            ]
+                MessageHandler(Filters.regex('^About$'), about),
+                MessageHandler(Filters.regex('^Products$'), list_categories),
+                MessageHandler(Filters.regex('^Cart$'), view_cart),
+                MessageHandler(Filters.regex('^Checkout$'), checkout_start),
+                MessageHandler(Filters.regex('^Order History$'), order_history),
+                MessageHandler(Filters.regex('^Support$'), support),
+            ],
+            CHECKOUT_ADDR: [MessageHandler(Filters.text & ~Filters.command, checkout_addr)],
+            CHECKOUT_NOTES: [MessageHandler(Filters.text & ~Filters.command, checkout_notes)],
+            CHECKOUT_PAYTYPE: [MessageHandler(Filters.text & ~Filters.command, checkout_paytype)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
         allow_reentry=True
@@ -354,44 +370,7 @@ def main():
     dp.add_handler(CallbackQueryHandler(category_callback, pattern='^cat\|'))
     dp.add_handler(CallbackQueryHandler(backcats_callback, pattern='^backcats$'))
     dp.add_handler(CallbackQueryHandler(add_to_cart_callback, pattern='^add\|'))
-
-    # Checkout sub-conversation handlers
     dp.add_handler(MessageHandler(Filters.regex('^/track'), track_order))
-    dp.add_handler(CommandHandler('orders', order_history))
-
-    # Handlers for checkout steps (simple implementation using message handlers with state stored in user_data)
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, lambda u, c: None))
-
-    # For simplicity, add separate handlers for checkout path using a lightweight approach
-    # We'll monitor user_data['checkout'] flags
-    def precheckout_filter(update: Update, context: CallbackContext):
-        return True
-
-    # Manual handlers for the checkout conversation flow
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, lambda update, context: None), group=1)
-
-    # Add handlers via simple dispatcher for checkout states using callback_data markers
-    # Instead, use a MessageHandler for the specific custom states by checking context.user_data
-    def generic_message(update: Update, context: CallbackContext):
-        if context.user_data.get('awaiting') == 'ADDR':
-            return checkout_addr(update, context)
-        if context.user_data.get('awaiting') == 'NOTES':
-            return checkout_notes(update, context)
-        if context.user_data.get('awaiting') == 'PAYTYPE':
-            return checkout_paytype(update, context)
-        return
-
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, generic_message), group=2)
-
-    # When checkout_start called, we set awaiting state to 'ADDR'
-    # Modify checkout_start to set awaiting flag properly
-    def checkout_start_wrapper(update: Update, context: CallbackContext):
-        ret = checkout_start(update, context)
-        if ret == 'ADDR':
-            context.user_data['awaiting'] = 'ADDR'
-        return ret
-
-    dp.add_handler(MessageHandler(Filters.regex('^(Checkout)$'), checkout_start_wrapper), group=3)
 
     updater.start_polling()
     print('Bot started')
