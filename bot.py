@@ -5,6 +5,7 @@ import time
 from functools import wraps
 from uuid import uuid4
 from dotenv import load_dotenv
+import gnupg
 from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update)
 from telegram.ext import (Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler, ConversationHandler, CallbackContext)
 
@@ -15,9 +16,13 @@ if not TOKEN:
     exit(1)
 
 DATA_FILE = os.path.join(os.path.dirname(__file__), 'data.json')
+GNUPG_HOME = os.path.join(os.path.dirname(__file__), '.gnupg')
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Initialize GPG
+gpg = gnupg.GPG(gnupghome=GNUPG_HOME)
 
 # Conversation states
 ASK_SECRET, ASK_COUNTRY, MAIN_MENU, CHECKOUT_ADDR, CHECKOUT_NOTES, CHECKOUT_PAYTYPE = range(6)
@@ -32,6 +37,66 @@ def load_data():
 def save_data(data):
     with open(DATA_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2)
+
+
+# PGP helper functions
+def generate_pgp_keys():
+    """Generate a PGP key pair if not exists."""
+    data = load_data()
+    pgp_config = data.get('pgp_config', {})
+    
+    if pgp_config.get('key_generated'):
+        return pgp_config.get('public_key')
+    
+    # Generate new key
+    input_data = gpg.gen_key_input(
+        key_type='RSA',
+        key_length=2048,
+        name_email='bot@ecommerce.local',
+        name_real='Ecommerce Bot'
+    )
+    key = gpg.gen_key(input_data)
+    key_id = str(key)
+    
+    # Export public key
+    public_key = gpg.export_keys(key_id)
+    
+    # Save to data.json
+    data['pgp_config']['key_generated'] = True
+    data['pgp_config']['public_key'] = public_key
+    data['pgp_config']['key_id'] = key_id
+    save_data(data)
+    
+    return public_key
+
+
+def encrypt_address(address):
+    """Encrypt delivery address with the bot's public key."""
+    data = load_data()
+    public_key = data.get('pgp_config', {}).get('public_key')
+    
+    if not public_key:
+        # Generate keys if not exists
+        public_key = generate_pgp_keys()
+    
+    # Import public key
+    import_result = gpg.import_keys(public_key)
+    key_id = import_result.fingerprints[0] if import_result.fingerprints else None
+    
+    if not key_id:
+        # Fallback: try to get from existing keys
+        data = load_data()
+        key_id = data.get('pgp_config', {}).get('key_id')
+    
+    # Encrypt
+    encrypted_data = gpg.encrypt(address, key_id, always_trust=True)
+    return str(encrypted_data)
+
+
+def decrypt_address(encrypted_address):
+    """Decrypt delivery address."""
+    decrypted_data = gpg.decrypt(encrypted_address)
+    return str(decrypted_data)
 
 
 # Decorator to ensure user exists
@@ -243,8 +308,11 @@ def checkout_start(update: Update, context: CallbackContext):
 
 def checkout_addr(update: Update, context: CallbackContext):
     addr = update.message.text.strip()
-    context.user_data['addr'] = addr
-    update.message.reply_text('Any delivery notes? (or send "skip")')
+    # Encrypt address
+    encrypted_addr = encrypt_address(addr)
+    context.user_data['addr'] = encrypted_addr
+    context.user_data['addr_plain'] = addr  # Store plain for reference
+    update.message.reply_text('Address saved (encrypted). Any delivery notes? (or send "skip")')
     return CHECKOUT_NOTES
 
 
@@ -278,7 +346,7 @@ def checkout_paytype(update: Update, context: CallbackContext):
         'order_id': order_id,
         'user': secret,
         'items': cart.copy(),
-        'address': context.user_data.get('addr'),
+        'address_encrypted': context.user_data.get('addr'),
         'notes': context.user_data.get('notes', ''),
         'payment_type': pay,
         'status': 'pending',
@@ -292,8 +360,8 @@ def checkout_paytype(update: Update, context: CallbackContext):
     payinfo = data.get('payment', {})
     addrinfo = payinfo.get('btc_address') if pay == 'BTC' else payinfo.get('usdt_address')
     total = order_total(order)
-    msg = "Order {} created!\nTotal: {:.2f} {}\nPay to: {}\n\nThen send /track {} to see status.".format(
-        order_id, total, pay, addrinfo, order_id)
+    msg = "Order {} created!\nTotal: {:.2f} {}\nPay to: {}\n\nYour address is encrypted. Send /download_address {} to get your encrypted address file.\nThen send /track {} to see status.".format(
+        order_id, total, pay, addrinfo, order_id, order_id)
     update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
     return show_main_menu(update, context)
 
@@ -315,6 +383,52 @@ def track_order(update: Update, context: CallbackContext):
             update.message.reply_text("Order {}: status {}. Items: {} Total: ${:.2f}".format(oid, o['status'], len(o['items']), order_total(o)))
             return
     update.message.reply_text('Order not found.')
+
+
+@ensure_user
+def download_address(update: Update, context: CallbackContext):
+    """Download encrypted address as a file."""
+    args = update.message.text.split()
+    if len(args) < 2:
+        update.message.reply_text('Usage: /download_address ORDER_ID')
+        return
+    
+    oid = args[1]
+    secret = context.user_data.get('secret')
+    data = load_data()
+    
+    # Find order
+    order = None
+    for o in data.get('orders', []):
+        if o['order_id'] == oid and o.get('user') == secret:
+            order = o
+            break
+    
+    if not order:
+        update.message.reply_text('Order not found or you do not have permission to access it.')
+        return
+    
+    encrypted_addr = order.get('address_encrypted', '')
+    if not encrypted_addr:
+        update.message.reply_text('No encrypted address found for this order.')
+        return
+    
+    # Create temporary file
+    filename = "{}_address.asc".format(oid)
+    filepath = os.path.join(os.path.dirname(__file__), filename)
+    
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(encrypted_addr)
+    
+    # Send file
+    with open(filepath, 'rb') as f:
+        update.message.reply_document(f, filename=filename, caption="Encrypted delivery address for order {}".format(oid))
+    
+    # Clean up
+    try:
+        os.remove(filepath)
+    except:
+        pass
 
 
 @ensure_user
@@ -371,6 +485,7 @@ def main():
     dp.add_handler(CallbackQueryHandler(backcats_callback, pattern='^backcats$'))
     dp.add_handler(CallbackQueryHandler(add_to_cart_callback, pattern='^add\|'))
     dp.add_handler(MessageHandler(Filters.regex('^/track'), track_order))
+    dp.add_handler(MessageHandler(Filters.regex('^/download_address'), download_address))
 
     updater.start_polling()
     print('Bot started')

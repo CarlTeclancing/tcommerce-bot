@@ -28,5 +28,9 @@
     "btc_address": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
     "usdt_address": "TetherDummyAddress1234567890"
   },
-  "orders": []
+  "orders": [],
+  "pgp_config": {
+    "public_key": "",
+    "key_generated": false
+  }
 }
